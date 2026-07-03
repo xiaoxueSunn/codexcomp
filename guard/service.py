@@ -53,7 +53,10 @@ def _exe_and_args(host: str | None, port: int | None,
 
 
 def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+    # errors="replace": Windows tools (taskkill/schtasks) emit localized,
+    # non-UTF-8 output that would otherwise raise UnicodeDecodeError.
+    return subprocess.run(cmd, check=check, capture_output=True,
+                          text=True, errors="replace")
 
 
 # --- Linux (systemd user unit) ----------------------------------------------
@@ -165,6 +168,14 @@ def _startup_vbs_path() -> Path:
     return startup / f"{LABEL}.vbs"
 
 
+def _stop_other_instances() -> None:
+    """Kill running proxy instances by image name, EXCLUDING this process — the
+    console-script launcher shares the codex-516-guard.exe image name, so an
+    unfiltered taskkill would terminate the very command that's running."""
+    _run(["taskkill", "/f", "/im", f"{LABEL}.exe",
+          "/fi", f"PID ne {os.getpid()}"], check=False)
+
+
 def _install_windows(argv: list[str]) -> None:
     cmd = subprocess.list2cmdline(argv)              # e.g. "C:\...\codex-516-guard.exe"
     vbs_literal = '"' + cmd.replace('"', '""') + '"'  # VBScript string literal
@@ -172,18 +183,18 @@ def _install_windows(argv: list[str]) -> None:
     path = _startup_vbs_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(vbs, encoding="utf-8")
-    _run(["taskkill", "/im", f"{LABEL}.exe", "/f"], check=False)  # drop any stale instance
-    _run(["wscript", str(path)], check=False)                    # start now, hidden
-    print(f"installed + started Startup launcher (no admin, hidden): {path}")
+    print(f"installed Startup launcher (no admin, hidden): {path}")
     print("  runs at next logon; disable with: codex-516-guard uninstall-service")
+    _stop_other_instances()                          # replace any prior instance...
+    _run(["wscript", str(path)], check=False)        # ...and start now, hidden
 
 
 def _uninstall_windows() -> None:
     path = _startup_vbs_path()
     existed = path.exists()
     path.unlink(missing_ok=True)
-    _run(["taskkill", "/im", f"{LABEL}.exe", "/f"], check=False)  # stop the running proxy
     print(f"removed Startup launcher{'' if existed else ' (was not present)'}: {path}")
+    _stop_other_instances()                          # stop the running proxy (not self)
 
 
 # --- dispatch ----------------------------------------------------------------
