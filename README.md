@@ -62,19 +62,31 @@ openai_base_url = "http://127.0.0.1:8787/v1"
 
 **关闭**：注释掉 `openai_base_url` 行 + 停掉代理进程。代理停止而 key 在位时，Codex 会因上游不可达报错。
 
-## 开机自启动
+## 开机自启动（可选，默认不开）
 
-代理是**用户会话内**被 Codex 调用的回环服务，所以三平台都选「随用户登录启动、跑在用户上下文」的方式
-（而不是系统级服务——系统服务跑在无用户环境的 session 里，够不到用户 profile 下的 uv 可执行文件与代理设置）。
-先用 `which codex-516-guard`（Unix/macOS）或 `where.exe codex-516-guard`（Windows）拿到绝对路径备用。
+安装本身**不注册任何自启动**——是否开机自启完全由你决定。要开时一条命令，不想开就别运行它。
+
+```bash
+codex-516-guard install-service     # 注册并立即启动（当前平台）
+codex-516-guard uninstall-service   # 撤销
+```
+
+`install-service` 按平台选「随用户登录启动、跑在用户上下文」的方式（而非系统级服务——系统服务跑在无用户环境的
+session 里，够不到用户 profile 下的 uv 可执行文件与代理设置）：**Linux/WSL** → systemd user unit；
+**macOS** → launchd LaunchAgent（`~/Library/LaunchAgents/`）；**Windows** → onlogon 计划任务（`schtasks`）。
+自定义端口等参数会一并写进自启动条目：`codex-516-guard install-service --port 8790`。
+
+下面是各平台**手动等价操作**（想自己管、或 `install-service` 在你的环境跑不动时用）。先用
+`which codex-516-guard`（Unix/macOS）/ `where.exe codex-516-guard`（Windows）拿到绝对路径。
 
 ### Linux / WSL — systemd user unit
 
-见 `systemd/codex-516-guard.service.example`：
+`install-service` 生成的等价 unit 见 `systemd/codex-516-guard.service.example`：
 
 ```bash
 cp systemd/codex-516-guard.service.example ~/.config/systemd/user/codex-516-guard.service
 systemctl --user daemon-reload && systemctl --user enable --now codex-516-guard
+loginctl enable-linger   # 可选：无需登录也在开机时启动
 ```
 
 ### macOS — launchd LaunchAgent
