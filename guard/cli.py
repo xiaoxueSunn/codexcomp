@@ -21,11 +21,12 @@ def _add_run_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--host", default="127.0.0.1",
                    help="bind address (default: 127.0.0.1; keep it loopback)")
     p.add_argument("--port", type=int, default=8787,
-                   help="bind port (default: 8787). If busy, the next free port is used "
-                        "unless --strict-port is set.")
-    p.add_argument("--strict-port", action="store_true",
-                   help="fail if --port is busy instead of scanning for the next free one "
-                        "(use when Codex is wired to a fixed openai_base_url port)")
+                   help="bind port (default: 8787). Must match Codex's openai_base_url; "
+                        "if busy the proxy exits (a wired proxy must own its exact port).")
+    p.add_argument("--auto-port", action="store_true",
+                   help="if --port is busy, scan for the next free port and print it. "
+                        "Only for interactive one-off runs — you must then wire Codex to "
+                        "the printed port. Not for a wired background service.")
     p.add_argument("--upstream", default=None,
                    help="upstream base URL (default: https://chatgpt.com/backend-api/codex)")
     p.add_argument("--log-level", default="info",
@@ -52,12 +53,18 @@ def _serve(args) -> int:
     if args.upstream:
         os.environ["GUARD_UPSTREAM_BASE"] = args.upstream
     port = args.port
-    if not args.strict_port:
+    if args.auto_port:
         port = _pick_port(args.host, args.port)
         if port != args.port:
             print(f"port {args.port} in use; bound {port} instead — "
                   f"wire Codex to  openai_base_url = \"http://{args.host}:{port}/v1\"",
                   flush=True)
+    elif _port_in_use(args.host, args.port):
+        # A wired proxy must own its exact port — fail loudly, don't drift.
+        print(f"error: port {args.port} is already in use. Free it, or pick another "
+              f"port with --port N (and set Codex's openai_base_url to match). "
+              f"Use --auto-port only for interactive one-off runs.", flush=True)
+        return 1
     logging.basicConfig(level=args.log_level.upper(),
                         format="%(levelname)s:%(name)s:%(message)s")
     uvicorn.run("guard.server:app", host=args.host, port=port,
