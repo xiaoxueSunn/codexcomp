@@ -1,0 +1,11 @@
+[project]
+name = "codex-516-guard"
+version = "0.1.0"
+description = "Local Responses proxy for Codex: detects 518n-2 reasoning truncation and folds auto-continuation rounds into one response. Mechanism credit: neteroster/CodexCont (MIT); implementation original."
+requires-python = ">=3.12"
+dependencies = [
+    "starlette>=0.41",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "zstandard>=0.23",
+]

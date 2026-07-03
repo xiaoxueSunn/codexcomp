@@ -1,0 +1,19 @@
+# systemd user unit example. Install:
+#   cp systemd/codex-516-guard.service.example ~/.config/systemd/user/codex-516-guard.service
+#   (adjust the paths to your clone location)
+#   systemctl --user daemon-reload && systemctl --user enable --now codex-516-guard
+[Unit]
+Description=codex-516-guard: local Responses proxy folding gpt-5.5 518n-2 reasoning truncation
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.local/share/codex-516-guard
+ExecStart=%h/.local/share/codex-516-guard/.venv/bin/python run.py
+Restart=on-failure
+RestartSec=2
+# If your systemd user manager exports a SOCKS proxy (ALL_PROXY), httpx would
+# need extra deps to honor it — drop the SOCKS vars and let HTTP(S)_PROXY win.
+UnsetEnvironment=ALL_PROXY all_proxy SOCKS_PROXY socks_proxy
+
+[Install]
+WantedBy=default.target
