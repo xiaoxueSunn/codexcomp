@@ -138,22 +138,38 @@ def _uninstall_macos() -> None:
     print(f"removed launchd LaunchAgent{'' if existed else ' (was not present)'}: {path}")
 
 
-# --- Windows (onlogon scheduled task) ---------------------------------------
+# --- Windows (Startup-folder VBS launcher; no admin, hidden window) ----------
+#
+# Task Scheduler (onlogon) would also work but `schtasks /create` requires an
+# elevated shell on locked-down machines. A Startup-folder launcher needs no
+# admin; a tiny VBS wrapper runs the console-less proxy fully hidden.
+
+
+def _startup_vbs_path() -> Path:
+    startup = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / \
+        "Start Menu" / "Programs" / "Startup"
+    return startup / f"{LABEL}.vbs"
 
 
 def _install_windows(argv: list[str]) -> None:
-    tr = subprocess.list2cmdline(argv)
-    _run(["schtasks", "/create", "/tn", LABEL, "/tr", tr,
-          "/sc", "onlogon", "/rl", "limited", "/f"])
-    _run(["schtasks", "/run", "/tn", LABEL], check=False)
-    print(f"installed + started onlogon scheduled task: {LABEL}")
-    print("  disable: codex-516-guard uninstall-service")
+    cmd = subprocess.list2cmdline(argv)              # e.g. "C:\...\codex-516-guard.exe"
+    vbs_literal = '"' + cmd.replace('"', '""') + '"'  # VBScript string literal
+    vbs = f'CreateObject("WScript.Shell").Run {vbs_literal}, 0, False\n'
+    path = _startup_vbs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(vbs, encoding="utf-8")
+    _run(["taskkill", "/im", f"{LABEL}.exe", "/f"], check=False)  # drop any stale instance
+    _run(["wscript", str(path)], check=False)                    # start now, hidden
+    print(f"installed + started Startup launcher (no admin, hidden): {path}")
+    print("  runs at next logon; disable with: codex-516-guard uninstall-service")
 
 
 def _uninstall_windows() -> None:
-    r = _run(["schtasks", "/delete", "/tn", LABEL, "/f"], check=False)
-    ok = r.returncode == 0
-    print(f"removed scheduled task {LABEL}{'' if ok else ' (was not present)'}")
+    path = _startup_vbs_path()
+    existed = path.exists()
+    path.unlink(missing_ok=True)
+    _run(["taskkill", "/im", f"{LABEL}.exe", "/f"], check=False)  # stop the running proxy
+    print(f"removed Startup launcher{'' if existed else ' (was not present)'}: {path}")
 
 
 # --- dispatch ----------------------------------------------------------------
