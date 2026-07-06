@@ -14,9 +14,7 @@ import socket
 import sys
 import tempfile
 
-from . import service
-
-PORT_SCAN_TRIES = 20
+from . import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_UPSTREAM, service
 
 
 def _bind_headless_streams() -> None:
@@ -38,17 +36,13 @@ def _bind_headless_streams() -> None:
 
 
 def _add_run_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--host", default="127.0.0.1",
-                   help="bind address (default: 127.0.0.1; keep it loopback)")
-    p.add_argument("--port", type=int, default=8787,
-                   help="bind port (default: 8787). Must match Codex's openai_base_url; "
+    p.add_argument("--host", default=DEFAULT_HOST,
+                   help=f"bind address (default: {DEFAULT_HOST}; keep it loopback)")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT,
+                   help=f"bind port (default: {DEFAULT_PORT}). Must match Codex's openai_base_url; "
                         "if busy the proxy exits (a wired proxy must own its exact port).")
-    p.add_argument("--auto-port", action="store_true",
-                   help="if --port is busy, scan for the next free port and print it. "
-                        "Only for interactive one-off runs — you must then wire Codex to "
-                        "the printed port. Not for a wired background service.")
     p.add_argument("--upstream", default=None,
-                   help="upstream base URL (default: https://chatgpt.com/backend-api/codex)")
+                   help=f"upstream base URL (default: {DEFAULT_UPSTREAM})")
     p.add_argument("--log-level", default="info",
                    choices=["critical", "error", "warning", "info", "debug"])
 
@@ -59,35 +53,19 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
-def _pick_port(host: str, start: int) -> int:
-    """First free port at or after `start` (scans up to PORT_SCAN_TRIES). Falls
-    back to `start` so the bind fails loudly if nothing free was found."""
-    for port in range(start, start + PORT_SCAN_TRIES):
-        if not _port_in_use(host, port):
-            return port
-    return start
-
-
 def _serve(args) -> int:
     import uvicorn
-    if args.upstream:
-        os.environ["CODEXCOMP_UPSTREAM_BASE"] = args.upstream
-    port = args.port
-    if args.auto_port:
-        port = _pick_port(args.host, args.port)
-        if port != args.port:
-            print(f"port {args.port} in use; bound {port} instead — "
-                  f"wire Codex to  openai_base_url = \"http://{args.host}:{port}/v1\"",
-                  flush=True)
-    elif _port_in_use(args.host, args.port):
+
+    from .server import build_app
+    if _port_in_use(args.host, args.port):
         # A wired proxy must own its exact port — fail loudly, don't drift.
         print(f"error: port {args.port} is already in use. Free it, or pick another "
-              f"port with --port N (and set Codex's openai_base_url to match). "
-              f"Use --auto-port only for interactive one-off runs.", flush=True)
+              f"port with --port N (and set Codex's openai_base_url to match).",
+              flush=True)
         return 1
     logging.basicConfig(level=args.log_level.upper(),
                         format="%(levelname)s:%(name)s:%(message)s")
-    uvicorn.run("codexcomp.server:app", host=args.host, port=port,
+    uvicorn.run(build_app(args.upstream), host=args.host, port=args.port,
                 log_level=args.log_level)
     return 0
 

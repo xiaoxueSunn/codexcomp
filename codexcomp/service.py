@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import DEFAULT_HOST, DEFAULT_PORT
+
 LABEL = "codexcomp"
 MAC_LABEL = "com.dzshzx.codexcomp"
 
@@ -41,9 +43,9 @@ def _exe_and_args(host: str | None, port: int | None,
                   upstream: str | None, log_level: str | None) -> list[str]:
     """Resolved executable path plus any non-default run flags."""
     argv = [_resolve_exe()]
-    if host and host != "127.0.0.1":
+    if host and host != DEFAULT_HOST:
         argv += ["--host", host]
-    if port and port != 8787:
+    if port and port != DEFAULT_PORT:
         argv += ["--port", str(port)]
     if upstream:
         argv += ["--upstream", upstream]

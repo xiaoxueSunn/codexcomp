@@ -5,7 +5,7 @@ Run: uv run python test_fold.py
 import asyncio
 import json
 
-from codexcomp.fold import DONE, fold, STEP
+from codexcomp.fold import DONE, RoundOpenError, fold, STEP
 
 
 def reasoning_round(rid: str, reasoning_toks: int, text: str | None, enc: bool = True):
@@ -41,7 +41,7 @@ def reasoning_round(rid: str, reasoning_toks: int, text: str | None, enc: bool =
     return evs
 
 
-async def main():
+async def test_happy_fold():
     opened_bodies = []
     rounds = [
         reasoning_round("rs_1", STEP - 2, "TRUNCATED ANSWER"),   # 516 -> continue
@@ -106,8 +106,79 @@ async def main():
     assert otypes == [("reasoning", "rs_1"), ("reasoning", "rs_2"),
                       ("reasoning", "rs_3"), ("message", "msg_rs_3")], otypes
 
-    print("fold self-test: ALL PASS")
     print("terminal usage:", json.dumps(u))
+
+
+async def test_round1_rejected():
+    """Upstream rejects round 1: fold itself yields the response.failed terminal."""
+    async def opener(body):
+        raise RoundOpenError(429, "quota exceeded")
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    assert len(out) == 1, out
+    ev = out[0]
+    assert ev["type"] == "response.failed", ev
+    assert ev["response"]["status"] == "failed"
+    assert ev["response"]["error"]["code"] == 429
+    assert "quota exceeded" in ev["response"]["error"]["message"]
+    assert ev["sequence_number"] == 0
+
+
+async def test_continuation_open_fails():
+    """Round 2 fails to open: incomplete terminal, round 1 reasoning kept,
+    truncated message never flushed."""
+    calls = []
+
+    async def opener(body):
+        calls.append(body)
+        if len(calls) > 1:
+            raise RoundOpenError(500, "boom")
+
+        async def gen():
+            for ev in reasoning_round("rs_1", STEP - 2, "TRUNCATED"):
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    assert len(calls) == 2, len(calls)
+    term = out[-1]
+    assert term["type"] == "response.incomplete", term
+    resp = term["response"]
+    assert resp["incomplete_details"]["reason"] == "upstream_error"
+    assert resp["metadata"]["proxy_stopped_reason"] == "upstream_error"
+    assert [i["type"] for i in resp["output"]] == ["reasoning"]
+    deltas = [e["delta"] for e in out
+              if isinstance(e, dict) and e["type"] == "response.output_text.delta"]
+    assert deltas == [], deltas
+
+
+async def test_upstream_eof():
+    """Stream ends without a terminal event: incomplete terminal, tentative
+    output is not an answer."""
+    evs = reasoning_round("rs_1", 404, "TENTATIVE")[:-1]  # strip the terminal
+
+    async def opener(body):
+        async def gen():
+            for ev in evs:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    term = out[-1]
+    assert term["type"] == "response.incomplete", term
+    assert term["response"]["incomplete_details"]["reason"] == "upstream_eof"
+    assert [i["type"] for i in term["response"]["output"]] == ["reasoning"]
+    deltas = [e["delta"] for e in out
+              if isinstance(e, dict) and e["type"] == "response.output_text.delta"]
+    assert deltas == [], deltas
+
+
+async def main():
+    await test_happy_fold()
+    await test_round1_rejected()
+    await test_continuation_open_fails()
+    await test_upstream_eof()
+    print("fold self-test: ALL PASS")
 
 
 asyncio.run(main())

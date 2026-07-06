@@ -32,7 +32,8 @@ RoundOpener = Callable[[dict[str, Any]], Awaitable[AsyncIterator[dict[str, Any]]
 
 
 class RoundOpenError(Exception):
-    """Continuation round could not be opened (upstream HTTP >= 400)."""
+    """A round could not be opened (upstream HTTP >= 400). Raised by the
+    opener; always handled inside fold(), never escapes to the transport."""
 
     def __init__(self, status: int, detail: str):
         super().__init__(f"upstream {status}: {detail[:200]}")
@@ -144,8 +145,9 @@ def agent_usage(
 
 def _fmt(usage: dict[str, Any] | None) -> str:
     u = usage or {}
+    cached = (u.get("input_tokens_details") or {}).get("cached_tokens")
     return (
-        f"in={u.get('input_tokens')} out={u.get('output_tokens')} "
+        f"in={u.get('input_tokens')} cached={cached} out={u.get('output_tokens')} "
         f"reason={reasoning_tokens(u)} total={u.get('total_tokens')}"
     )
 
@@ -187,6 +189,15 @@ def _terminal_event(
     return {"type": (upstream_terminal or {}).get("type", "response.completed"), "response": resp}
 
 
+def _failed_event(exc: RoundOpenError) -> dict[str, Any]:
+    """Downstream terminal for a request upstream rejected outright (round 1)."""
+    return {
+        "type": "response.failed",
+        "response": {"status": "failed",
+                     "error": {"message": str(exc), "code": exc.status}},
+    }
+
+
 # --- the fold ----------------------------------------------------------------
 
 
@@ -196,7 +207,11 @@ async def fold(
 ) -> AsyncIterator[dict[str, Any] | object]:
     """Yield downstream events (dicts, plus the DONE sentinel when upstream sent
     one). Every yielded event gets a proxy-owned sequence_number; output_index
-    is renumbered into one downstream space across rounds."""
+    is renumbered into one downstream space across rounds.
+
+    Sole owner of downstream terminal shapes: upstream failures surface as
+    terminal events (response.failed for a rejected round 1, response.incomplete
+    otherwise) — RoundOpenError never escapes to the transport."""
     orig_input = list(base_body.get("input") or [])
     seq = 0
     ds_oi = 0
@@ -214,8 +229,22 @@ async def fold(
         seq += 1
         return ev
 
+    def incomplete(reason: str) -> dict[str, Any]:
+        """Synthesized degraded-stop terminal — never fabricates a completed answer."""
+        return stamp(_terminal_event(
+            None, base_response, final_output,
+            agent_usage(first_usage, summed_usage, usage, flushed_final=False),
+            rounds_info, summed_usage, reason,
+            incomplete_reason=reason))
+
     round_no = 0
-    events = await open_round(next_round_body(base_body, orig_input))
+    usage: dict[str, Any] | None = None
+    try:
+        events = await open_round(next_round_body(base_body, orig_input))
+    except RoundOpenError as exc:
+        log.warning("round 1 rejected by upstream: %s", exc)
+        yield stamp(_failed_event(exc))
+        return
 
     while True:
         round_no += 1
@@ -224,7 +253,7 @@ async def fold(
         buffered: list[dict[str, Any]] = []  # {oi, item, events}
         round_reasoning: list[dict[str, Any]] = []
         terminal: dict[str, Any] | None = None
-        usage: dict[str, Any] | None = None
+        usage = None
 
         try:
             async for ev in events:
@@ -274,16 +303,10 @@ async def fold(
                         entry["item"] = ev.get("item") or entry["item"]
                 else:
                     yield stamp(ev)  # unknown scope: forward best-effort
-        except RoundOpenError:
-            raise  # only raised before any event; handled by caller for round 1
         except Exception as exc:  # upstream died mid-stream
             log.warning("round %d: upstream error mid-stream: %r", round_no, exc)
             _sum_usage(summed_usage, usage)
-            yield stamp(_terminal_event(
-                None, base_response, final_output,
-                agent_usage(first_usage, summed_usage, usage, flushed_final=False),
-                rounds_info, summed_usage, "upstream_error",
-                incomplete_reason="upstream_error"))
+            yield incomplete("upstream_error")
             return
 
         # ---- round ended: decide continue / stop ----------------------------
@@ -323,21 +346,13 @@ async def fold(
                 events = await open_round(next_round_body(base_body, orig_input + replay_tail))
             except RoundOpenError as exc:
                 log.warning("continuation round %d failed to open: %s", round_no + 1, exc)
-                yield stamp(_terminal_event(
-                    None, base_response, final_output,
-                    agent_usage(first_usage, summed_usage, usage, flushed_final=False),
-                    rounds_info, summed_usage, "upstream_error",
-                    incomplete_reason="upstream_error"))
+                yield incomplete("upstream_error")
                 return
             continue
 
         if terminal is None:  # EOF with no terminal: tentative output is NOT an answer
             log.warning("round %d: upstream EOF with no terminal event", round_no)
-            yield stamp(_terminal_event(
-                None, base_response, final_output,
-                agent_usage(first_usage, summed_usage, usage, flushed_final=False),
-                rounds_info, summed_usage, "upstream_eof",
-                incomplete_reason="upstream_eof"))
+            yield incomplete("upstream_eof")
             return
 
         # Clean stop: flush this round's buffered output as the real answer.

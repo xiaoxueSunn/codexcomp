@@ -107,7 +107,6 @@ A state machine (`codexcomp/fold.py`) runs per round:
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | Bind address — keep it loopback. |
 | `--port` | `8787` | Must match `openai_base_url`; if busy the proxy exits. |
-| `--auto-port` | off | Interactive one-off runs only: scan for the next free port and print it. |
 | `--upstream` | `https://chatgpt.com/backend-api/codex` | Upstream base URL. |
 | `--log-level` | `info` | One of `critical` / `error` / `warning` / `info` / `debug`. |
 

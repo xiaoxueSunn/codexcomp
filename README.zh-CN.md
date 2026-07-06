@@ -99,7 +99,6 @@ openai_base_url = "http://127.0.0.1:8787/v1"
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | 绑定地址——请保持回环。 |
 | `--port` | `8787` | 须与 `openai_base_url` 一致；被占用时报错退出。 |
-| `--auto-port` | 关 | 仅限交互式临时运行：扫描下一个空闲端口并打印。 |
 | `--upstream` | `https://chatgpt.com/backend-api/codex` | 上游 base URL。 |
 | `--log-level` | `info` | `critical` / `error` / `warning` / `info` / `debug` 之一。 |
 

@@ -4,7 +4,11 @@ Downstream (Codex, wired via top-level `openai_base_url`):
   * WebSocket /v1/responses  — Codex's preferred transport (openai-beta
     responses_websockets): client sends {"type":"response.create", ...body...}
     frames, we answer with response.* event frames; the connection is reused
-    for sequential requests (prewarm + turns).
+    for sequential requests (prewarm + turns). The protocol is STATEFUL:
+    Codex sends `generate:false` prewarm frames (connection setup, must not
+    generate) and compresses follow-up requests to `previous_response_id` +
+    incremental input. WsSession implements that contract locally so the
+    upstream request is always stateless full input.
   * POST /v1/responses       — SSE fallback; request body may be zstd/gzip
     compressed (built-in provider sends zstd when request compression is on).
   * anything else under /v1/ — transparent passthrough to the upstream base
@@ -30,14 +34,10 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from . import DEFAULT_UPSTREAM
 from .fold import DONE, RoundOpenError, fold
 
 log = logging.getLogger("codexcomp.server")
-
-UPSTREAM_BASE = os.environ.get(
-    "CODEXCOMP_UPSTREAM_BASE", "https://chatgpt.com/backend-api/codex"
-).rstrip("/")
-RESPONSES_URL = UPSTREAM_BASE + "/responses"
 
 # hop-by-hop / transport-specific headers never forwarded upstream
 _DROP_HEADERS = {
@@ -57,7 +57,6 @@ def upstream_headers(raw: Any) -> dict[str, str]:
         if k.lower() in _DROP_HEADERS:
             continue
         out[k] = value.decode() if isinstance(value, bytes) else value
-    out["accept"] = "text/event-stream"
     return out
 
 
@@ -110,17 +109,20 @@ class UpstreamRounds:
     """RoundOpener bound to one downstream request's headers; closes the
     previous round's response before opening the next."""
 
-    def __init__(self, client: httpx.AsyncClient, headers: dict[str, str]):
+    def __init__(self, client: httpx.AsyncClient, responses_url: str,
+                 headers: dict[str, str]):
         self.client = client
+        self.responses_url = responses_url
         self.headers = headers
         self._resp: httpx.Response | None = None
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
         await self.aclose()
         req = self.client.build_request(
-            "POST", RESPONSES_URL,
+            "POST", self.responses_url,
             content=json.dumps(body, ensure_ascii=False).encode(),
-            headers={**self.headers, "content-type": "application/json"},
+            headers={**self.headers, "content-type": "application/json",
+                     "accept": "text/event-stream"},
             timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
         )
         resp = await self.client.send(req, stream=True)
@@ -140,7 +142,111 @@ class UpstreamRounds:
             self._resp = None
 
 
+# --- downstream websocket session state ----------------------------------------
+
+
+class UnknownPreviousResponse(Exception):
+    """An incremental frame referenced a response id this session never issued
+    (proxy restarted, or the previous turn did not complete)."""
+
+    def __init__(self, prev_id: Any):
+        super().__init__(f"unknown previous_response_id: {prev_id!r}")
+
+
+class WsSession:
+    """The stateful half of Codex's responses_websockets contract, scoped to one
+    downstream connection — exactly the scope Codex reuses response ids in.
+
+    Codex compares `previous_request.input + items_added` against its next full
+    input to build an incremental frame; both halves passed through us (the
+    envelope input and the output_item.done items we streamed), so the full
+    input can be reconstructed exactly. State is only valid after a completed
+    response — any failed/incomplete/aborted request invalidates it, matching
+    Codex, which records a reusable LastResponse only on Completed."""
+
+    def __init__(self) -> None:
+        self.last_id: str | None = None
+        self.last_input: list[Any] = []
+        self.last_output: list[Any] = []
+        self._prewarms = 0
+
+    def expand(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Resolve an envelope against session state: reconstruct full input
+        from an incremental frame (empty delta included) and strip the ws-only
+        `previous_response_id`. Raises UnknownPreviousResponse on mismatch."""
+        body = dict(body)
+        prev_id = body.pop("previous_response_id", None)
+        if prev_id is not None:
+            if self.last_id is None or prev_id != self.last_id:
+                raise UnknownPreviousResponse(prev_id)
+            delta = list(body.get("input") or [])
+            body["input"] = [*self.last_input, *self.last_output, *delta]
+            log.info("ws: rebuilt incremental frame: %d delta -> %d full input items",
+                     len(delta), len(body["input"]))
+        return body
+
+    def prewarm_ack(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Consume a `generate:false` prewarm frame locally: remember its input
+        as the conversation prefix and mint the completed frame Codex waits for.
+        Never forwarded — the upstream SSE endpoint rejects `generate`."""
+        self._prewarms += 1
+        self.last_id = f"resp_codexcomp_prewarm_{self._prewarms}"
+        self.last_input = list(body.get("input") or [])
+        self.last_output = []
+        log.info("ws: prewarm acked locally as %s (%d input items)",
+                 self.last_id, len(self.last_input))
+        return {
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": {
+                "id": self.last_id, "object": "response", "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 0,
+                          "input_tokens_details": {"cached_tokens": 0},
+                          "output_tokens": 0,
+                          "output_tokens_details": {"reasoning_tokens": 0},
+                          "total_tokens": 0},
+            },
+        }
+
+    def note_request(self, body: dict[str, Any]) -> None:
+        """A generating request starts: remember its full input, invalidate the
+        reusable id until a completed terminal arrives."""
+        self.last_id = None
+        self.last_input = list(body.get("input") or [])
+        self.last_output = []
+
+    def note_event(self, ev: dict[str, Any]) -> None:
+        if ev.get("type") != "response.completed":
+            return
+        resp = ev.get("response") or {}
+        self.last_id = resp.get("id") or None
+        self.last_output = list(resp.get("output") or [])
+
+
+def unknown_previous_response_frame(exc: UnknownPreviousResponse) -> dict[str, Any]:
+    return {
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {"status": "failed",
+                     "error": {"message": f"codexcomp: {exc}; reconnect and resend full input",
+                               "code": "unknown_previous_response_id"}},
+    }
+
+
 # --- downstream endpoints -----------------------------------------------------
+
+
+async def drive_fold(state: Any, headers: dict[str, str],
+                     body: dict[str, Any]) -> AsyncIterator[dict | object]:
+    """One folded request: owns the UpstreamRounds lifecycle and yields
+    downstream events. Transports only serialize what comes out of here."""
+    rounds = UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
+    try:
+        async for ev in fold(body, rounds.open):
+            yield ev
+    finally:
+        await rounds.aclose()
 
 
 def sse_bytes(ev: dict | object) -> bytes:
@@ -158,20 +264,11 @@ async def responses_post(request: Request) -> Response:
     except (ValueError, json.JSONDecodeError) as exc:
         return JSONResponse({"error": f"bad request body: {exc}"}, status_code=400)
 
-    rounds = UpstreamRounds(request.app.state.client, upstream_headers(request.headers.raw))
+    events = drive_fold(request.app.state, upstream_headers(request.headers.raw), body)
 
     async def stream() -> AsyncIterator[bytes]:
-        try:
-            async for ev in fold(body, rounds.open):
-                yield sse_bytes(ev)
-        except RoundOpenError as exc:  # round 1 rejected: surface upstream error
-            yield sse_bytes({
-                "type": "response.failed",
-                "response": {"status": "failed",
-                             "error": {"message": str(exc), "code": exc.status}},
-            })
-        finally:
-            await rounds.aclose()
+        async for ev in events:
+            yield sse_bytes(ev)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -179,7 +276,7 @@ async def responses_post(request: Request) -> Response:
 async def responses_ws(ws: WebSocket) -> None:
     await ws.accept()
     headers = upstream_headers(ws.headers.raw)
-    rounds = UpstreamRounds(ws.app.state.client, headers)
+    sess = WsSession()
     try:
         while True:
             try:
@@ -191,33 +288,38 @@ async def responses_ws(ws: WebSocket) -> None:
                 continue
             body = {k: v for k, v in envelope.items() if k != "type"}
             try:
-                async for ev in fold(body, rounds.open):
-                    if ev is DONE:
-                        continue
-                    await ws.send_text(json.dumps(ev, ensure_ascii=False))
-            except RoundOpenError as exc:
-                await ws.send_text(json.dumps({
-                    "type": "response.failed",
-                    "response": {"status": "failed",
-                                 "error": {"message": str(exc), "code": exc.status}},
-                }))
+                body = sess.expand(body)
+            except UnknownPreviousResponse as exc:
+                # Fail loud and drop the connection: Codex reconnects and
+                # resends full input — never silently answer without context.
+                log.warning("ws: %s — closing so the client resends full input", exc)
+                await ws.send_text(json.dumps(unknown_previous_response_frame(exc),
+                                              ensure_ascii=False))
+                await ws.close(code=1011)
+                return
+            if body.pop("generate", None) is False:  # prewarm: never generate
+                await ws.send_text(json.dumps(sess.prewarm_ack(body), ensure_ascii=False))
+                continue
+            sess.note_request(body)
+            async for ev in drive_fold(ws.app.state, headers, body):
+                if ev is DONE:
+                    continue
+                sess.note_event(ev)
+                await ws.send_text(json.dumps(ev, ensure_ascii=False))
     except WebSocketDisconnect:
         pass
-    finally:
-        await rounds.aclose()
 
 
 async def passthrough(request: Request) -> Response:
     """Transparent proxy for every other /v1/* call (e.g. GET /v1/models)."""
     suffix = request.path_params["path"]
-    url = f"{UPSTREAM_BASE}/{suffix}"
+    url = f"{request.app.state.upstream_base}/{suffix}"
     if request.url.query:
         url += "?" + request.url.query
     content = await request.body()
     if content:
         content = decompress_body(content, request.headers.get("content-encoding"))
     headers = upstream_headers(request.headers.raw)
-    headers.pop("accept", None)
     upstream = await request.app.state.client.request(
         request.method, url, content=content or None, headers=headers,
         timeout=httpx.Timeout(60),
@@ -229,11 +331,14 @@ async def passthrough(request: Request) -> Response:
     )
 
 
-async def health(_: Request) -> JSONResponse:
-    return JSONResponse({"ok": True, "upstream": UPSTREAM_BASE})
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({"ok": True, "upstream": request.app.state.upstream_base})
 
 
-def build_app() -> Starlette:
+def build_app(upstream_base: str | None = None) -> Starlette:
+    """Assemble the proxy app. `upstream_base` falls back to the
+    CODEXCOMP_UPSTREAM_BASE env var, then the official Codex backend."""
+    base = upstream_base or os.environ.get("CODEXCOMP_UPSTREAM_BASE") or DEFAULT_UPSTREAM
     app = Starlette(routes=[
         Route("/healthz", health),
         Route("/v1/responses", responses_post, methods=["POST"]),
@@ -242,7 +347,5 @@ def build_app() -> Starlette:
               methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]),
     ])
     app.state.client = httpx.AsyncClient(trust_env=True, http2=False)
+    app.state.upstream_base = base.rstrip("/")
     return app
-
-
-app = build_app()
