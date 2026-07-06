@@ -185,5 +185,4 @@ uv run codexcomp                  # 本地运行
 ## 许可
 
 [MIT](LICENSE) — 机制思路 credit：[**neteroster/CodexCont**](https://github.com/neteroster/CodexCont)
-（MIT），本项目复用其 518n−2「检测截断 + 续写」的思路、代码为独立实现；其版权声明保留于
-[LICENSE](LICENSE)。
+（MIT），本项目复用其 518n−2「检测截断 + 续写」的思路、代码为独立从零实现。

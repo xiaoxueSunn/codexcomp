@@ -206,5 +206,4 @@ Built for and shared with the [**LINUX DO**](https://linux.do) community, where 
 
 [MIT](LICENSE) — mechanism credit to
 [**neteroster/CodexCont**](https://github.com/neteroster/CodexCont) (MIT), whose 518n−2
-detect-and-continue idea this reuses with an independent implementation; its copyright notice
-is retained in [LICENSE](LICENSE).
+detect-and-continue idea this reuses with an independent, from-scratch implementation.
