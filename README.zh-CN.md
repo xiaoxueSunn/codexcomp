@@ -100,7 +100,38 @@ openai_base_url = "http://127.0.0.1:8787/v1"
 | `--host` | `127.0.0.1` | 绑定地址——请保持回环。 |
 | `--port` | `8787` | 须与 `openai_base_url` 一致；被占用时报错退出。 |
 | `--upstream` | `https://chatgpt.com/backend-api/codex` | 上游 base URL。 |
+| `--strip-authorization` | `false` | 转发上游前移除下游 `Authorization` 头。适用于通过 query 参数鉴权的 ModelHub 兼容端点，避免把 Codex 的 OpenAI bearer token 误传给上游。 |
 | `--log-level` | `info` | `critical` / `error` / `warning` / `info` / `debug` 之一。 |
+
+### ModelHub 兼容端点
+
+如果上游是通过 `ak` / `api-version` 等 query 参数鉴权的 ModelHub 兼容端点，可将 provider 的
+`base_url` 指到 `codexcomp`，并让 `codexcomp` 转发到真实 ModelHub：
+
+```bash
+codexcomp \
+  --upstream https://aidp.bytedance.net/api/modelhub/online \
+  --strip-authorization
+```
+
+临时测试配置示例：
+
+```toml
+[model_providers.azure]
+name = "Azure via codexcomp"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+request_max_retries = 50
+stream_max_retries = 50
+retry_429 = true
+
+[model_providers.azure.query_params]
+api-version = "2025-04-01-preview"
+ak = "<your-modelhub-ak>"
+```
+
+该模式会把 `/v1/responses?ak=...&api-version=...` 转发为
+`<upstream>/responses?ak=...&api-version=...`，并避免透传 OpenAI `Authorization`。
 
 ## 开机自启（可选，默认关闭）
 

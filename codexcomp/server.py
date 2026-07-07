@@ -25,6 +25,7 @@ import logging
 import os
 import zlib
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import zstandard
@@ -50,14 +51,33 @@ _DROP_HEADERS = {
 }
 
 
-def upstream_headers(raw: Any) -> dict[str, str]:
+def upstream_headers(raw: Any, *, strip_authorization: bool = False) -> dict[str, str]:
     out = {}
     for key, value in raw:
         k = key.decode() if isinstance(key, bytes) else key
-        if k.lower() in _DROP_HEADERS:
+        kl = k.lower()
+        if kl in _DROP_HEADERS:
+            continue
+        if strip_authorization and kl == "authorization":
             continue
         out[k] = value.decode() if isinstance(value, bytes) else value
     return out
+
+
+def append_query(url: str, query: str | bytes | None) -> str:
+    """Append a downstream query string to an upstream URL.
+
+    ModelHub-style providers put auth and API version in provider query_params,
+    so `/v1/responses?ak=...&api-version=...` must become
+    `<upstream>/responses?ak=...&api-version=...`.
+    """
+    if isinstance(query, bytes):
+        query = query.decode()
+    if not query:
+        return url
+    parts = urlsplit(url)
+    merged = f"{parts.query}&{query}" if parts.query else query
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, merged, parts.fragment))
 
 
 def decompress_body(data: bytes, encoding: str | None) -> bytes:
@@ -238,10 +258,12 @@ def unknown_previous_response_frame(exc: UnknownPreviousResponse) -> dict[str, A
 
 
 async def drive_fold(state: Any, headers: dict[str, str],
-                     body: dict[str, Any]) -> AsyncIterator[dict | object]:
+                     body: dict[str, Any],
+                     query: str | bytes | None = None) -> AsyncIterator[dict | object]:
     """One folded request: owns the UpstreamRounds lifecycle and yields
     downstream events. Transports only serialize what comes out of here."""
-    rounds = UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
+    responses_url = append_query(state.upstream_base + "/responses", query)
+    rounds = UpstreamRounds(state.client, responses_url, headers)
     try:
         async for ev in fold(body, rounds.open):
             yield ev
@@ -264,7 +286,15 @@ async def responses_post(request: Request) -> Response:
     except (ValueError, json.JSONDecodeError) as exc:
         return JSONResponse({"error": f"bad request body: {exc}"}, status_code=400)
 
-    events = drive_fold(request.app.state, upstream_headers(request.headers.raw), body)
+    events = drive_fold(
+        request.app.state,
+        upstream_headers(
+            request.headers.raw,
+            strip_authorization=request.app.state.strip_authorization,
+        ),
+        body,
+        request.url.query,
+    )
 
     async def stream() -> AsyncIterator[bytes]:
         async for ev in events:
@@ -275,7 +305,10 @@ async def responses_post(request: Request) -> Response:
 
 async def responses_ws(ws: WebSocket) -> None:
     await ws.accept()
-    headers = upstream_headers(ws.headers.raw)
+    headers = upstream_headers(
+        ws.headers.raw,
+        strip_authorization=ws.app.state.strip_authorization,
+    )
     sess = WsSession()
     try:
         while True:
@@ -301,7 +334,7 @@ async def responses_ws(ws: WebSocket) -> None:
                 await ws.send_text(json.dumps(sess.prewarm_ack(body), ensure_ascii=False))
                 continue
             sess.note_request(body)
-            async for ev in drive_fold(ws.app.state, headers, body):
+            async for ev in drive_fold(ws.app.state, headers, body, ws.url.query):
                 if ev is DONE:
                     continue
                 sess.note_event(ev)
@@ -319,7 +352,10 @@ async def passthrough(request: Request) -> Response:
     content = await request.body()
     if content:
         content = decompress_body(content, request.headers.get("content-encoding"))
-    headers = upstream_headers(request.headers.raw)
+    headers = upstream_headers(
+        request.headers.raw,
+        strip_authorization=request.app.state.strip_authorization,
+    )
     upstream = await request.app.state.client.request(
         request.method, url, content=content or None, headers=headers,
         timeout=httpx.Timeout(60),
@@ -335,10 +371,14 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "upstream": request.app.state.upstream_base})
 
 
-def build_app(upstream_base: str | None = None) -> Starlette:
+def build_app(upstream_base: str | None = None,
+              strip_authorization: bool | None = None) -> Starlette:
     """Assemble the proxy app. `upstream_base` falls back to the
     CODEXCOMP_UPSTREAM_BASE env var, then the official Codex backend."""
     base = upstream_base or os.environ.get("CODEXCOMP_UPSTREAM_BASE") or DEFAULT_UPSTREAM
+    if strip_authorization is None:
+        strip_authorization = os.environ.get(
+            "CODEXCOMP_STRIP_AUTHORIZATION", "").lower() in {"1", "true", "yes", "on"}
     app = Starlette(routes=[
         Route("/healthz", health),
         Route("/v1/responses", responses_post, methods=["POST"]),
@@ -348,4 +388,5 @@ def build_app(upstream_base: str | None = None) -> Starlette:
     ])
     app.state.client = httpx.AsyncClient(trust_env=True, http2=False)
     app.state.upstream_base = base.rstrip("/")
+    app.state.strip_authorization = strip_authorization
     return app
