@@ -19,6 +19,7 @@ USER1 = {"type": "message", "role": "user",
 FCO = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
 
 upstream_calls: list[dict] = []
+upstream_requests: list[httpx.Request] = []
 
 
 def canned_sse(rid: str) -> bytes:
@@ -38,6 +39,7 @@ def canned_sse(rid: str) -> bytes:
 
 
 def mock_upstream(request: httpx.Request) -> httpx.Response:
+    upstream_requests.append(request)
     body = json.loads(request.content)
     upstream_calls.append(body)
     if body.get("model") == "fail-me":
@@ -49,6 +51,12 @@ def mock_upstream(request: httpx.Request) -> httpx.Response:
 
 def make_client() -> TestClient:
     app = build_app("http://upstream.test/v1")
+    app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(mock_upstream))
+    return TestClient(app)
+
+
+def make_modelhub_client() -> TestClient:
+    app = build_app("http://upstream.test/v1", strip_authorization=True)
     app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(mock_upstream))
     return TestClient(app)
 
@@ -149,6 +157,23 @@ def test_post_sse_unchanged():
     assert upstream_calls[n_before]["input"] == [USER1]
 
 
+def test_modelhub_query_and_auth_handling():
+    """ModelHub-style providers authenticate via query params; do not forward
+    Codex's OpenAI bearer token as an upstream Authorization header."""
+    client = make_modelhub_client()
+    resp = client.post(
+        "/v1/responses?ak=AK123&api-version=2025-04-01-preview",
+        json={"model": "gpt-5.5", "stream": True, "input": [USER1]},
+        headers={"authorization": "Bearer should-not-forward"},
+    )
+    assert resp.status_code == 200
+    request = upstream_requests[-1]
+    assert str(request.url) == (
+        "http://upstream.test/v1/responses?ak=AK123&api-version=2025-04-01-preview"
+    )
+    assert "authorization" not in request.headers
+
+
 def main():
     test_prewarm_then_incremental()
     upstream_calls.clear()
@@ -156,7 +181,11 @@ def main():
     upstream_calls.clear()
     test_failed_turn_invalidates_state()
     upstream_calls.clear()
+    upstream_requests.clear()
     test_post_sse_unchanged()
+    upstream_calls.clear()
+    upstream_requests.clear()
+    test_modelhub_query_and_auth_handling()
     print("ws transport self-test: ALL PASS")
 
 

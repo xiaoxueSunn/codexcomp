@@ -108,7 +108,40 @@ A state machine (`codexcomp/fold.py`) runs per round:
 | `--host` | `127.0.0.1` | Bind address — keep it loopback. |
 | `--port` | `8787` | Must match `openai_base_url`; if busy the proxy exits. |
 | `--upstream` | `https://chatgpt.com/backend-api/codex` | Upstream base URL. |
+| `--strip-authorization` | `false` | Drop downstream `Authorization` before forwarding upstream. Useful for ModelHub-compatible endpoints that authenticate via query params such as `ak` / `api-version` instead of OpenAI bearer auth. |
 | `--log-level` | `info` | One of `critical` / `error` / `warning` / `info` / `debug`. |
+
+### ModelHub-compatible endpoints
+
+For ModelHub-compatible endpoints that authenticate via `ak` / `api-version` query params,
+point the provider `base_url` at `codexcomp` and point `codexcomp` at the real ModelHub
+endpoint:
+
+```bash
+codexcomp \
+  --upstream https://aidp.bytedance.net/api/modelhub/online \
+  --strip-authorization
+```
+
+Example temporary provider config:
+
+```toml
+[model_providers.azure]
+name = "Azure via codexcomp"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+request_max_retries = 50
+stream_max_retries = 50
+retry_429 = true
+
+[model_providers.azure.query_params]
+api-version = "2025-04-01-preview"
+ak = "<your-modelhub-ak>"
+```
+
+This mode forwards `/v1/responses?ak=...&api-version=...` as
+`<upstream>/responses?ak=...&api-version=...` and avoids forwarding OpenAI
+`Authorization`.
 
 ## Autostart (optional, off by default)
 

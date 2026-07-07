@@ -43,6 +43,10 @@ def _add_run_flags(p: argparse.ArgumentParser) -> None:
                         "if busy the proxy exits (a wired proxy must own its exact port).")
     p.add_argument("--upstream", default=None,
                    help=f"upstream base URL (default: {DEFAULT_UPSTREAM})")
+    p.add_argument("--strip-authorization", action="store_true",
+                   help="drop downstream Authorization before forwarding upstream. "
+                        "Useful for ModelHub-style providers that authenticate via "
+                        "query params such as ak/api-version instead of OpenAI bearer auth.")
     p.add_argument("--log-level", default="info",
                    choices=["critical", "error", "warning", "info", "debug"])
 
@@ -65,8 +69,12 @@ def _serve(args) -> int:
         return 1
     logging.basicConfig(level=args.log_level.upper(),
                         format="%(levelname)s:%(name)s:%(message)s")
-    uvicorn.run(build_app(args.upstream), host=args.host, port=args.port,
-                log_level=args.log_level)
+    uvicorn.run(
+        build_app(args.upstream, strip_authorization=args.strip_authorization),
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+    )
     return 0
 
 
