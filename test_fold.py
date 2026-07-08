@@ -2,6 +2,8 @@
 
 Run: uv run python test_fold.py
 """
+from __future__ import annotations
+
 import asyncio
 import json
 
@@ -173,11 +175,68 @@ async def test_upstream_eof():
     assert deltas == [], deltas
 
 
+async def test_interleaved_web_search_ordering():
+    """Terminal output preserves upstream arrival order: each buffered item
+    (message, web_search_call, function_call, ...) stays right after its owning
+    reasoning item. If reasoning is hoisted before its dependents, ModelHub
+    rejects the replay with 400 'was provided without its required reasoning
+    item'."""
+    # upstream sends: rs_A, ws_A(ref rs_A), rs_B, msg_B(ref rs_B)
+    upstream = [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_A", "type": "reasoning", "summary": []}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_A", "type": "reasoning",
+                  "encrypted_content": "ENC_A", "summary": []}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "ws_A", "type": "web_search_call"}},
+        {"type": "response.output_item.done", "output_index": 1,
+         "item": {"id": "ws_A", "type": "web_search_call",
+                  "action": {"type": "search", "query": "hello"}}},
+        {"type": "response.output_item.added", "output_index": 2,
+         "item": {"id": "rs_B", "type": "reasoning", "summary": []}},
+        {"type": "response.output_item.done", "output_index": 2,
+         "item": {"id": "rs_B", "type": "reasoning",
+                  "encrypted_content": "ENC_B", "summary": []}},
+        {"type": "response.output_item.added", "output_index": 3,
+         "item": {"id": "msg_B", "type": "message", "role": "assistant"}},
+        {"type": "response.output_item.done", "output_index": 3,
+         "item": {"id": "msg_B", "type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "done"}]}},
+        {"type": "response.completed", "response": {
+            "id": "resp_1", "status": "completed",
+            "usage": {"input_tokens": 50, "output_tokens": 60,
+                      "total_tokens": 110,
+                      "output_tokens_details": {"reasoning_tokens": 40}},
+        }},
+    ]
+
+    async def opener(body):
+        async def gen():
+            for ev in upstream:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    term = out[-1]
+    assert term["type"] == "response.completed", term
+    order = [(i["type"], i.get("id")) for i in term["response"]["output"]]
+    assert order == [
+        ("reasoning", "rs_A"),
+        ("web_search_call", "ws_A"),
+        ("reasoning", "rs_B"),
+        ("message", "msg_B"),
+    ], order
+
+
 async def main():
     await test_happy_fold()
     await test_round1_rejected()
     await test_continuation_open_fails()
     await test_upstream_eof()
+    await test_interleaved_web_search_ordering()
     print("fold self-test: ALL PASS")
 
 
