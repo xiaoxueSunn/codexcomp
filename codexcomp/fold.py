@@ -181,6 +181,16 @@ def _terminal_status(terminal: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _round_outcome(status: str | None, stopped_reason: str | None) -> str:
+    if status is None:
+        return "upstream_eof"
+    if stopped_reason:
+        return stopped_reason
+    if status == "completed":
+        return "clean"
+    return status
+
+
 # --- terminal reconstruction ---------------------------------------------------
 
 
@@ -386,6 +396,9 @@ async def fold(
         stopped_reason = None
         if not do_continue and n is not None:
             stopped_reason = (
+                "terminal_failed" if status == "failed"
+                else "terminal_unknown" if status not in {"completed", "incomplete"}
+                else
                 "no_encrypted_content" if not has_enc
                 else "max_continue" if round_no > MAX_CONTINUE
                 else "tier_out_of_window"
@@ -395,8 +408,7 @@ async def fold(
             "round %d: %s | n=%s buffered=%s -> %s",
             round_no, _fmt(usage), n,
             [e["item"].get("type") for e in round_entries if e["kind"] == "buffered"],
-            "continue" if do_continue else
-            "upstream_eof" if terminal is None else stopped_reason or "clean",
+            "continue" if do_continue else _round_outcome(status, stopped_reason),
         )
 
         if do_continue:

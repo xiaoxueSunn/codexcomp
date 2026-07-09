@@ -255,6 +255,45 @@ async def test_upstream_failed_drops_tentative_buffered_output():
     assert resp["error"]["message"] == "failed after output"
 
 
+async def test_upstream_failed_with_truncation_fingerprint_does_not_continue():
+    """A failed terminal is never replayable, even if its usage happens to match
+    the 518n-2 continuation fingerprint."""
+    calls = []
+    upstream = [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "created_at": 111, "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_1", "type": "reasoning", "summary": []}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_1", "type": "reasoning",
+                  "encrypted_content": "ENC_1", "summary": []}},
+        {"type": "response.failed", "response": {
+            "id": "resp_1",
+            "status": "failed",
+            "usage": {"input_tokens": 50, "output_tokens": STEP - 2,
+                      "total_tokens": 50 + STEP - 2,
+                      "output_tokens_details": {"reasoning_tokens": STEP - 2}},
+            "error": {"type": "server_error", "message": "failed at truncation tier"},
+        }},
+    ]
+
+    async def opener(body):
+        calls.append(body)
+
+        async def gen():
+            for ev in upstream:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    assert len(calls) == 1, "failed terminal must not trigger continuation"
+    term = out[-1]
+    assert term["type"] == "response.failed", term
+    resp = term["response"]
+    assert resp["metadata"]["proxy_stopped_reason"] == "terminal_failed"
+    assert resp["metadata"]["proxy_rounds"][0]["n"] == 1
+
+
 async def test_upstream_incomplete_drops_tentative_buffered_output():
     """response.incomplete without a continuation fingerprint is not a clean
     answer, so buffered output stays tentative."""
@@ -499,6 +538,7 @@ async def main():
     await test_upstream_eof()
     await test_upstream_failed_preserves_error()
     await test_upstream_failed_drops_tentative_buffered_output()
+    await test_upstream_failed_with_truncation_fingerprint_does_not_continue()
     await test_upstream_incomplete_drops_tentative_buffered_output()
     await test_upstream_incomplete_can_continue_on_truncation_fingerprint()
     await test_interleaved_web_search_ordering()
