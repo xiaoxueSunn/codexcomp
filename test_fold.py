@@ -209,6 +209,152 @@ async def test_upstream_failed_preserves_error():
     assert "backend failed" in resp["error"]["message"]
 
 
+async def test_upstream_failed_drops_tentative_buffered_output():
+    """A failed terminal is not a clean answer. Buffered message/tool output from
+    that round must not be streamed or persisted into terminal output."""
+    upstream = [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "created_at": 111, "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_1", "type": "reasoning", "summary": []}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_1", "type": "reasoning",
+                  "encrypted_content": "ENC_1", "summary": []}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "msg_1", "type": "message", "role": "assistant"}},
+        {"type": "response.output_text.delta", "output_index": 1,
+         "item_id": "msg_1", "content_index": 0, "delta": "tentative"},
+        {"type": "response.output_item.done", "output_index": 1,
+         "item": {"id": "msg_1", "type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "tentative"}]}},
+        {"type": "response.failed", "response": {
+            "id": "resp_1",
+            "status": "failed",
+            "usage": {"input_tokens": 50, "output_tokens": 61, "total_tokens": 111,
+                      "output_tokens_details": {"reasoning_tokens": 40}},
+            "error": {"type": "server_error", "message": "failed after output"},
+        }},
+    ]
+
+    async def opener(body):
+        async def gen():
+            for ev in upstream:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    deltas = [e["delta"] for e in out
+              if isinstance(e, dict) and e["type"] == "response.output_text.delta"]
+    assert deltas == [], deltas
+    term = out[-1]
+    assert term["type"] == "response.failed", term
+    resp = term["response"]
+    assert [(i["type"], i.get("id")) for i in resp["output"]] == [
+        ("reasoning", "rs_1")
+    ]
+    assert resp["error"]["message"] == "failed after output"
+
+
+async def test_upstream_incomplete_drops_tentative_buffered_output():
+    """response.incomplete without a continuation fingerprint is not a clean
+    answer, so buffered output stays tentative."""
+    calls = []
+    upstream = [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "created_at": 111, "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_1", "type": "reasoning", "summary": []}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_1", "type": "reasoning",
+                  "encrypted_content": "ENC_1", "summary": []}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "msg_1", "type": "message", "role": "assistant"}},
+        {"type": "response.output_item.done", "output_index": 1,
+         "item": {"id": "msg_1", "type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "tentative"}]}},
+        {"type": "response.incomplete", "response": {
+            "id": "resp_1",
+            "status": "incomplete",
+            "usage": {"input_tokens": 50, "output_tokens": 80,
+                      "total_tokens": 130,
+                      "output_tokens_details": {"reasoning_tokens": 40}},
+            "incomplete_details": {"reason": "max_output_tokens"},
+        }},
+    ]
+
+    async def opener(body):
+        calls.append(body)
+
+        async def gen():
+            for ev in upstream:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    assert len(calls) == 1, "incomplete terminal must not trigger continuation"
+    term = out[-1]
+    assert term["type"] == "response.incomplete", term
+    resp = term["response"]
+    assert resp["incomplete_details"]["reason"] == "max_output_tokens"
+    assert [(i["type"], i.get("id")) for i in resp["output"]] == [
+        ("reasoning", "rs_1")
+    ]
+
+
+async def test_upstream_incomplete_can_continue_on_truncation_fingerprint():
+    """An incomplete terminal can still be the 518n-2 truncation signal. Continue
+    from encrypted reasoning, then only flush the final completed round output."""
+    calls = []
+    rounds = [
+        [
+            {"type": "response.created", "sequence_number": 0,
+             "response": {"id": "resp_1", "created_at": 111, "status": "in_progress"}},
+            {"type": "response.output_item.added", "output_index": 0,
+             "item": {"id": "rs_1", "type": "reasoning", "summary": []}},
+            {"type": "response.output_item.done", "output_index": 0,
+             "item": {"id": "rs_1", "type": "reasoning",
+                      "encrypted_content": "ENC_1", "summary": []}},
+            {"type": "response.output_item.added", "output_index": 1,
+             "item": {"id": "msg_1", "type": "message", "role": "assistant"}},
+            {"type": "response.output_item.done", "output_index": 1,
+             "item": {"id": "msg_1", "type": "message", "role": "assistant",
+                      "content": [{"type": "output_text", "text": "tentative"}]}},
+            {"type": "response.incomplete", "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "usage": {"input_tokens": 50, "output_tokens": STEP - 2,
+                          "total_tokens": 50 + STEP - 2,
+                          "output_tokens_details": {"reasoning_tokens": STEP - 2}},
+                "incomplete_details": {"reason": "max_output_tokens"},
+            }},
+        ],
+        reasoning_round("rs_2", 40, "REAL ANSWER"),
+    ]
+
+    async def opener(body):
+        calls.append(body)
+        idx = len(calls) - 1
+
+        async def gen():
+            for ev in rounds[idx]:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    assert len(calls) == 2, len(calls)
+    assert [i.get("type") for i in calls[1]["input"]] == ["reasoning", "message"]
+    deltas = [e["delta"] for e in out
+              if isinstance(e, dict) and e["type"] == "response.output_text.delta"]
+    assert deltas == ["REAL ANSWER"], deltas
+    term = out[-1]
+    assert term["type"] == "response.completed", term
+    assert [(i["type"], i.get("id")) for i in term["response"]["output"]] == [
+        ("reasoning", "rs_1"),
+        ("reasoning", "rs_2"),
+        ("message", "msg_rs_2"),
+    ]
+
+
 async def test_interleaved_web_search_ordering():
     """Terminal output preserves upstream arrival order: each buffered item
     (message, web_search_call, function_call, ...) stays right after its owning
@@ -352,6 +498,9 @@ async def main():
     await test_continuation_open_fails()
     await test_upstream_eof()
     await test_upstream_failed_preserves_error()
+    await test_upstream_failed_drops_tentative_buffered_output()
+    await test_upstream_incomplete_drops_tentative_buffered_output()
+    await test_upstream_incomplete_can_continue_on_truncation_fingerprint()
     await test_interleaved_web_search_ordering()
     await test_stream_ordering_when_message_finishes_late()
     await test_stream_ordering_when_web_search_finishes_late()

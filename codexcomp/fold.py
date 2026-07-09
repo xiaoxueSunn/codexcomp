@@ -164,6 +164,23 @@ def _error_summary(error: Any) -> str:
     return " ".join(parts) if parts else "present"
 
 
+def _terminal_status(terminal: dict[str, Any] | None) -> str | None:
+    if terminal is None:
+        return None
+    resp = terminal.get("response") or {}
+    status = resp.get("status")
+    if status:
+        return str(status)
+    etype = terminal.get("type")
+    if etype == "response.completed":
+        return "completed"
+    if etype == "response.failed":
+        return "failed"
+    if etype == "response.incomplete":
+        return "incomplete"
+    return None
+
+
 # --- terminal reconstruction ---------------------------------------------------
 
 
@@ -357,8 +374,11 @@ async def fold(
         ]
         has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
 
+        status = _terminal_status(terminal)
+        terminal_completed = terminal is not None and status == "completed"
+        terminal_replayable = terminal is not None and status in {"completed", "incomplete"}
         do_continue = (
-            terminal is not None
+            terminal_replayable
             and in_continue_window(n)
             and has_enc
             and round_no <= MAX_CONTINUE
@@ -425,21 +445,25 @@ async def fold(
         # Desktop persists response_item events as replay input; if a later
         # reasoning item streams ahead of an earlier buffered message/tool call,
         # the next request can fail upstream history validation.
+        #
+        # Failed/incomplete upstream terminals are different: any buffered
+        # message/tool is tentative, and streaming it can poison the client's
+        # persisted history. Preserve reasoning and the terminal error details,
+        # but do not fabricate an answer from a failed round.
         for entry in round_entries:
-            if entry["emitted"]:
+            if not terminal_completed and entry["kind"] != "reasoning":
                 continue
-            entry["emitted"] = True
-            entry["ds_oi"] = ds_oi
-            for out_ev in entry["events"]:
-                if "output_index" in out_ev:
-                    out_ev["output_index"] = ds_oi
-                yield stamp(out_ev)
-            ds_oi += 1
-        for entry in round_entries:
+            if not entry["emitted"]:
+                entry["emitted"] = True
+                entry["ds_oi"] = ds_oi
+                for out_ev in entry["events"]:
+                    if "output_index" in out_ev:
+                        out_ev["output_index"] = ds_oi
+                    yield stamp(out_ev)
+                ds_oi += 1
             if entry["done"]:
                 final_output.append(entry["item"])
 
-        status = (terminal.get("response") or {}).get("status", "completed")
         terminal_resp = terminal.get("response") or {}
         if status == "failed":
             log.warning(
@@ -452,7 +476,7 @@ async def fold(
                      round_no, _fmt(summed_usage), status, stopped_reason or "natural")
         yield stamp(_terminal_event(
             terminal, base_response, final_output,
-            agent_usage(first_usage, summed_usage, usage, flushed_final=True),
+            agent_usage(first_usage, summed_usage, usage, flushed_final=terminal_completed),
             rounds_info, summed_usage, stopped_reason))
         if saw_done:
             yield DONE
