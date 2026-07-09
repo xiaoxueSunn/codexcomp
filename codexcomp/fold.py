@@ -248,11 +248,8 @@ async def fold(
 
     while True:
         round_no += 1
-        oi_to_ds: dict[Any, int] = {}
-        kind: dict[Any, str] = {}
-        buffered: list[dict[str, Any]] = []  # {oi, item, events}
-        round_reasoning: list[dict[str, Any]] = []
-        round_items_in_order: list[dict[str, Any]] = []
+        round_entries: list[dict[str, Any]] = []  # {oi, kind, item, events, emitted, done}
+        entries_by_oi: dict[Any, dict[str, Any]] = {}
         terminal: dict[str, Any] | None = None
         usage = None
 
@@ -277,40 +274,59 @@ async def fold(
                 oi = ev.get("output_index")
                 if etype == "response.output_item.added":
                     item = ev.get("item") or {}
+                    item_kind = "reasoning" if item.get("type") == "reasoning" else "buffered"
+                    entry = {
+                        "oi": oi,
+                        "kind": item_kind,
+                        "item": item,
+                        "events": [ev],
+                        "emitted": False,
+                        "done": False,
+                    }
+                    round_entries.append(entry)
+                    entries_by_oi[oi] = entry
                     if item.get("type") == "reasoning":
-                        kind[oi] = "reasoning"
-                        oi_to_ds[oi] = ds_oi
-                        ev["output_index"] = ds_oi
-                        ds_oi += 1
-                        yield stamp(ev)
-                    else:
-                        kind[oi] = "buffered"
-                        buffered.append({"oi": oi, "item": item, "events": [ev]})
+                        blocked_by_buffered = any(
+                            prev["kind"] == "buffered" and not prev["emitted"]
+                            for prev in round_entries[:-1]
+                        )
+                        if not blocked_by_buffered:
+                            entry["emitted"] = True
+                            entry["ds_oi"] = ds_oi
+                            ev["output_index"] = ds_oi
+                            ds_oi += 1
+                            yield stamp(ev)
                     continue
 
-                k = kind.get(oi)
-                if k == "reasoning":
-                    if oi in oi_to_ds:
-                        ev["output_index"] = oi_to_ds[oi]
-                    if etype == "response.output_item.done":
-                        item = ev.get("item") or {}
-                        round_reasoning.append(item)
-                        round_items_in_order.append(item)
-                    yield stamp(ev)
-                elif k == "buffered":
-                    entry = next(e for e in buffered if e["oi"] == oi)
+                entry = entries_by_oi.get(oi)
+                if entry is not None:
                     entry["events"].append(ev)
                     if etype == "response.output_item.done":
-                        entry["item"] = ev.get("item") or entry["item"]
-                        round_items_in_order.append(entry["item"])
+                        item = ev.get("item") or {}
+                        entry["item"] = item or entry["item"]
+                        entry["done"] = True
+                    if entry["kind"] == "reasoning" and entry["emitted"]:
+                        if "output_index" in ev:
+                            ev["output_index"] = entry["ds_oi"]
+                        yield stamp(ev)
                 else:
                     yield stamp(ev)  # unknown scope: forward best-effort
         except Exception as exc:  # upstream died mid-stream
             log.warning("round %d: upstream error mid-stream: %r", round_no, exc)
             _sum_usage(summed_usage, usage)
-            for item in round_items_in_order:
-                if item.get("type") == "reasoning":
-                    final_output.append(item)
+            for entry in round_entries:
+                if entry["kind"] != "reasoning":
+                    continue
+                if not entry["emitted"]:
+                    entry["emitted"] = True
+                    entry["ds_oi"] = ds_oi
+                    for out_ev in entry["events"]:
+                        if "output_index" in out_ev:
+                            out_ev["output_index"] = ds_oi
+                        yield stamp(out_ev)
+                    ds_oi += 1
+                if entry["done"]:
+                    final_output.append(entry["item"])
             yield incomplete("upstream_error")
             return
 
@@ -321,6 +337,10 @@ async def fold(
         rt = reasoning_tokens(usage)
         n = tier_n(rt)
         rounds_info.append({"round": round_no, "reasoning_tokens": rt, "n": n})
+        round_reasoning = [
+            entry["item"] for entry in round_entries
+            if entry["kind"] == "reasoning" and entry["done"]
+        ]
         has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
 
         do_continue = (
@@ -340,15 +360,25 @@ async def fold(
         log.info(
             "round %d: %s | n=%s buffered=%s -> %s",
             round_no, _fmt(usage), n,
-            [e["item"].get("type") for e in buffered],
+            [e["item"].get("type") for e in round_entries if e["kind"] == "buffered"],
             "continue" if do_continue else
             "upstream_eof" if terminal is None else stopped_reason or "clean",
         )
 
         if do_continue:
-            for item in round_items_in_order:
-                if item.get("type") == "reasoning":
-                    final_output.append(item)
+            for entry in round_entries:
+                if entry["kind"] != "reasoning":
+                    continue
+                if not entry["emitted"]:
+                    entry["emitted"] = True
+                    entry["ds_oi"] = ds_oi
+                    for out_ev in entry["events"]:
+                        if "output_index" in out_ev:
+                            out_ev["output_index"] = ds_oi
+                        yield stamp(out_ev)
+                    ds_oi += 1
+                if entry["done"]:
+                    final_output.append(entry["item"])
             replay_tail.extend([*round_reasoning, commentary_nudge()])
             try:
                 events = await open_round(next_round_body(base_body, orig_input + replay_tail))
@@ -360,24 +390,40 @@ async def fold(
 
         if terminal is None:  # EOF with no terminal: tentative output is NOT an answer
             log.warning("round %d: upstream EOF with no terminal event", round_no)
-            for item in round_items_in_order:
-                if item.get("type") == "reasoning":
-                    final_output.append(item)
+            for entry in round_entries:
+                if entry["kind"] != "reasoning":
+                    continue
+                if not entry["emitted"]:
+                    entry["emitted"] = True
+                    entry["ds_oi"] = ds_oi
+                    for out_ev in entry["events"]:
+                        if "output_index" in out_ev:
+                            out_ev["output_index"] = ds_oi
+                        yield stamp(out_ev)
+                    ds_oi += 1
+                if entry["done"]:
+                    final_output.append(entry["item"])
             yield incomplete("upstream_eof")
             return
 
         # Clean stop: flush this round's buffered output as the real answer.
-        # final_output preserves upstream arrival order (reasoning interleaved
-        # with its buffered dependents) so the agent's replay of the transcript
-        # keeps each buffered item next to its owning reasoning.
-        for entry in buffered:
-            for ev in entry["events"]:
-                if "output_index" in ev:
-                    ev["output_index"] = ds_oi
-                yield stamp(ev)
+        # The downstream stream must preserve output item order too. Codex
+        # Desktop persists response_item events as replay input; if a later
+        # reasoning item streams ahead of an earlier buffered message/tool call,
+        # the next request can fail upstream history validation.
+        for entry in round_entries:
+            if entry["emitted"]:
+                continue
+            entry["emitted"] = True
+            entry["ds_oi"] = ds_oi
+            for out_ev in entry["events"]:
+                if "output_index" in out_ev:
+                    out_ev["output_index"] = ds_oi
+                yield stamp(out_ev)
             ds_oi += 1
-        for item in round_items_in_order:
-            final_output.append(item)
+        for entry in round_entries:
+            if entry["done"]:
+                final_output.append(entry["item"])
 
         status = (terminal.get("response") or {}).get("status", "completed")
         log.info("done: %d round(s) | %s | status=%s stop=%s",

@@ -231,12 +231,69 @@ async def test_interleaved_web_search_ordering():
     ], order
 
 
+async def test_stream_ordering_when_buffered_item_finishes_late():
+    """The live stream must not let a later reasoning item overtake an earlier
+    buffered item. Codex Desktop persists streamed response_item order as replay
+    input; if it sees rs_A, rs_B, msg_A, ModelHub rejects msg_A as detached from
+    rs_A on the next turn."""
+    upstream = [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_A", "type": "reasoning", "summary": []}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_A", "type": "reasoning",
+                  "encrypted_content": "ENC_A", "summary": []}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "msg_A", "type": "message", "role": "assistant"}},
+        {"type": "response.output_item.added", "output_index": 2,
+         "item": {"id": "rs_B", "type": "reasoning", "summary": []}},
+        {"type": "response.output_item.done", "output_index": 2,
+         "item": {"id": "rs_B", "type": "reasoning",
+                  "encrypted_content": "ENC_B", "summary": []}},
+        {"type": "response.output_text.delta", "output_index": 1,
+         "item_id": "msg_A", "content_index": 0, "delta": "working"},
+        {"type": "response.output_item.done", "output_index": 1,
+         "item": {"id": "msg_A", "type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "working"}]}},
+        {"type": "response.completed", "response": {
+            "id": "resp_1", "status": "completed",
+            "usage": {"input_tokens": 50, "output_tokens": 60,
+                      "total_tokens": 110,
+                      "output_tokens_details": {"reasoning_tokens": 40}},
+        }},
+    ]
+
+    async def opener(body):
+        async def gen():
+            for ev in upstream:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    streamed_items = [
+        (ev["item"]["type"], ev["item"].get("id"))
+        for ev in out
+        if isinstance(ev, dict) and ev["type"] == "response.output_item.done"
+    ]
+    assert streamed_items == [
+        ("reasoning", "rs_A"),
+        ("message", "msg_A"),
+        ("reasoning", "rs_B"),
+    ], streamed_items
+
+    term = out[-1]
+    terminal_items = [(i["type"], i.get("id")) for i in term["response"]["output"]]
+    assert terminal_items == streamed_items, terminal_items
+
+
 async def main():
     await test_happy_fold()
     await test_round1_rejected()
     await test_continuation_open_fails()
     await test_upstream_eof()
     await test_interleaved_web_search_ordering()
+    await test_stream_ordering_when_buffered_item_finishes_late()
     print("fold self-test: ALL PASS")
 
 
