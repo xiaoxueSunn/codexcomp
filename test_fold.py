@@ -231,11 +231,16 @@ async def test_interleaved_web_search_ordering():
     ], order
 
 
-async def test_stream_ordering_when_buffered_item_finishes_late():
+async def _assert_stream_ordering_when_buffered_item_finishes_late(
+    buffered_item: dict,
+    buffered_done_extra: dict | None = None,
+):
     """The live stream must not let a later reasoning item overtake an earlier
     buffered item. Codex Desktop persists streamed response_item order as replay
     input; if it sees rs_A, rs_B, msg_A, ModelHub rejects msg_A as detached from
     rs_A on the next turn."""
+    buffered_id = buffered_item["id"]
+    buffered_done = {**buffered_item, **(buffered_done_extra or {})}
     upstream = [
         {"type": "response.created", "sequence_number": 0,
          "response": {"id": "resp_1", "status": "in_progress"}},
@@ -245,17 +250,16 @@ async def test_stream_ordering_when_buffered_item_finishes_late():
          "item": {"id": "rs_A", "type": "reasoning",
                   "encrypted_content": "ENC_A", "summary": []}},
         {"type": "response.output_item.added", "output_index": 1,
-         "item": {"id": "msg_A", "type": "message", "role": "assistant"}},
+         "item": buffered_item},
         {"type": "response.output_item.added", "output_index": 2,
          "item": {"id": "rs_B", "type": "reasoning", "summary": []}},
         {"type": "response.output_item.done", "output_index": 2,
          "item": {"id": "rs_B", "type": "reasoning",
                   "encrypted_content": "ENC_B", "summary": []}},
         {"type": "response.output_text.delta", "output_index": 1,
-         "item_id": "msg_A", "content_index": 0, "delta": "working"},
+         "item_id": buffered_id, "content_index": 0, "delta": "working"},
         {"type": "response.output_item.done", "output_index": 1,
-         "item": {"id": "msg_A", "type": "message", "role": "assistant",
-                  "content": [{"type": "output_text", "text": "working"}]}},
+         "item": buffered_done},
         {"type": "response.completed", "response": {
             "id": "resp_1", "status": "completed",
             "usage": {"input_tokens": 50, "output_tokens": 60,
@@ -278,7 +282,7 @@ async def test_stream_ordering_when_buffered_item_finishes_late():
     ]
     assert streamed_items == [
         ("reasoning", "rs_A"),
-        ("message", "msg_A"),
+        (buffered_item["type"], buffered_id),
         ("reasoning", "rs_B"),
     ], streamed_items
 
@@ -287,13 +291,36 @@ async def test_stream_ordering_when_buffered_item_finishes_late():
     assert terminal_items == streamed_items, terminal_items
 
 
+async def test_stream_ordering_when_message_finishes_late():
+    await _assert_stream_ordering_when_buffered_item_finishes_late(
+        {"id": "msg_A", "type": "message", "role": "assistant"},
+        {"content": [{"type": "output_text", "text": "working"}]},
+    )
+
+
+async def test_stream_ordering_when_web_search_finishes_late():
+    await _assert_stream_ordering_when_buffered_item_finishes_late(
+        {"id": "ws_A", "type": "web_search_call"},
+        {"action": {"type": "search", "query": "hello"}},
+    )
+
+
+async def test_stream_ordering_when_function_call_finishes_late():
+    await _assert_stream_ordering_when_buffered_item_finishes_late(
+        {"id": "fc_A", "type": "function_call", "name": "exec_command",
+         "call_id": "call_A", "arguments": "{}"},
+    )
+
+
 async def main():
     await test_happy_fold()
     await test_round1_rejected()
     await test_continuation_open_fails()
     await test_upstream_eof()
     await test_interleaved_web_search_ordering()
-    await test_stream_ordering_when_buffered_item_finishes_late()
+    await test_stream_ordering_when_message_finishes_late()
+    await test_stream_ordering_when_web_search_finishes_late()
+    await test_stream_ordering_when_function_call_finishes_late()
     print("fold self-test: ALL PASS")
 
 
