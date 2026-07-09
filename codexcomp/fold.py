@@ -152,6 +152,18 @@ def _fmt(usage: dict[str, Any] | None) -> str:
     )
 
 
+def _error_summary(error: Any) -> str:
+    if not isinstance(error, dict) or not error:
+        return "none"
+    parts = []
+    for key in ("type", "code", "message"):
+        value = error.get(key)
+        if value is not None:
+            text = str(value).replace("\n", "\\n")
+            parts.append(f"{key}={text[:300]}")
+    return " ".join(parts) if parts else "present"
+
+
 # --- terminal reconstruction ---------------------------------------------------
 
 
@@ -186,6 +198,8 @@ def _terminal_event(
     resp["status"] = tresp.get("status", "completed")
     if "incomplete_details" in tresp:
         resp["incomplete_details"] = tresp["incomplete_details"]
+    if "error" in tresp:
+        resp["error"] = tresp["error"]
     return {"type": (upstream_terminal or {}).get("type", "response.completed"), "response": resp}
 
 
@@ -426,8 +440,16 @@ async def fold(
                 final_output.append(entry["item"])
 
         status = (terminal.get("response") or {}).get("status", "completed")
-        log.info("done: %d round(s) | %s | status=%s stop=%s",
-                 round_no, _fmt(summed_usage), status, stopped_reason or "natural")
+        terminal_resp = terminal.get("response") or {}
+        if status == "failed":
+            log.warning(
+                "done: %d round(s) | %s | status=%s stop=%s error=%s",
+                round_no, _fmt(summed_usage), status, stopped_reason or "natural",
+                _error_summary(terminal_resp.get("error")),
+            )
+        else:
+            log.info("done: %d round(s) | %s | status=%s stop=%s",
+                     round_no, _fmt(summed_usage), status, stopped_reason or "natural")
         yield stamp(_terminal_event(
             terminal, base_response, final_output,
             agent_usage(first_usage, summed_usage, usage, flushed_final=True),

@@ -175,6 +175,40 @@ async def test_upstream_eof():
     assert deltas == [], deltas
 
 
+async def test_upstream_failed_preserves_error():
+    """A terminal response.failed from upstream must stay transparent; losing
+    response.error makes Codex reconnects impossible to diagnose from client
+    sessions or proxy logs."""
+    upstream = [
+        {"type": "response.created", "sequence_number": 0,
+         "response": {"id": "resp_1", "created_at": 111, "status": "in_progress"}},
+        {"type": "response.failed", "response": {
+            "id": "resp_1",
+            "status": "failed",
+            "error": {
+                "type": "server_error",
+                "code": "upstream_failed",
+                "message": "backend failed after accepting request",
+            },
+        }},
+    ]
+
+    async def opener(body):
+        async def gen():
+            for ev in upstream:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold({"input": [], "stream": True}, opener)]
+    term = out[-1]
+    assert term["type"] == "response.failed", term
+    resp = term["response"]
+    assert resp["status"] == "failed"
+    assert resp["error"]["type"] == "server_error"
+    assert resp["error"]["code"] == "upstream_failed"
+    assert "backend failed" in resp["error"]["message"]
+
+
 async def test_interleaved_web_search_ordering():
     """Terminal output preserves upstream arrival order: each buffered item
     (message, web_search_call, function_call, ...) stays right after its owning
@@ -317,6 +351,7 @@ async def main():
     await test_round1_rejected()
     await test_continuation_open_fails()
     await test_upstream_eof()
+    await test_upstream_failed_preserves_error()
     await test_interleaved_web_search_ordering()
     await test_stream_ordering_when_message_finishes_late()
     await test_stream_ordering_when_web_search_finishes_late()
